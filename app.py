@@ -1,433 +1,355 @@
-# backend/app.py
+import os
+import uuid
 import pandas as pd
-import numpy as np
-import io
-import base64
-import json
-import warnings
-from typing import Dict, List, Optional, Tuple, Any
-
-from flask import Flask, request, jsonify, send_from_directory
+import logging
+from pathlib import Path
+from typing import Dict, Any, Optional, Union, List
+from dataclasses import dataclass
+from flask import Flask, request, jsonify
 from flask_cors import CORS
-
-import matplotlib
-
-matplotlib.use('Agg')  # Importante: Use o backend Agg para que matplotlib funcione em ambiente headless
-import matplotlib.pyplot as plt
-import seaborn as sns  # Se for usar seaborn para styling ou plots
-import os  # Para manipular caminhos de arquivo
-
-# --- Adicione esta constante para o diretório de imagens ---
-IMAGE_DIR = 'public_images'  # Nome da pasta onde as imagens serão salvas
-# Crie o diretório se ele não existir
-if not os.path.exists(IMAGE_DIR):
-    os.makedirs(IMAGE_DIR)
-# ---------------------------------------------------------
-
-
-app = Flask(__name__)
-CORS(app)  # Habilita CORS para todas as rotas
-
-# ====================================================================
-# INÍCIO DO CÓDIGO DA CLASSE EVASIONANALYZER (COMPLETO E AJUSTADO)
-# ====================================================================
-
-# --- Bibliotecas para análise de séries temporais ---
-from sktime.forecasting.arima import ARIMA
-from sktime.forecasting.theta import ThetaForecaster
-from sktime.utils.plotting import plot_series
-from sktime.forecasting.model_selection import temporal_train_test_split
-from sktime.performance_metrics.forecasting import mean_absolute_percentage_error
-
-# --- Bibliotecas para análise estatística ---
-from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
 from statsmodels.tsa.seasonal import seasonal_decompose
-from statsmodels.tsa.arima.model import ARIMA as StatsARIMA
+from statsmodels.tsa.stattools import acf, pacf
+from sktime.forecasting.arima import AutoARIMA
+import traceback
+from datetime import datetime
+import numpy as np
+from sklearn.metrics import mean_absolute_percentage_error
+
+# --- Configuração de Logging ---
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# --- Configuração da Aplicação ---
+app = Flask(__name__)
+CORS(app)
 
 
-# Classe EvasionAnalyzer (ADAPTADA)
+# Configurações como constantes
+class Config:
+    UPLOAD_FOLDER = Path("uploads")
+    MAX_CONTENT_LENGTH = 16 * 1024 * 1024  # 16MB
+    ALLOWED_EXTENSIONS = {'.csv'}
+    MIN_DATA_POINTS = 4
+
+
+Config.UPLOAD_FOLDER.mkdir(exist_ok=True)
+app.config['MAX_CONTENT_LENGTH'] = Config.MAX_CONTENT_LENGTH
+
+
+# --- Exceções Customizadas ---
+class DataProcessingError(Exception):
+    """Exceção para erros de processamento de dados"""
+    pass
+
+
+class InsufficientDataError(Exception):
+    """Exceção para dados insuficientes"""
+    pass
+
+
+# --- Classes de Dados ---
+@dataclass
+class AnalysisParams:
+    selected_unidades: Optional[List[str]] = None
+    selected_semestre: Optional[str] = None
+
+
+@dataclass
+class FileDetails:
+    unidades: List[str]
+    semestres: List[str]
+    preview_data: Dict[str, Any]
+
+
+# --- Validadores ---
+class DataValidator:
+    @staticmethod
+    def validate_file_extension(filename: str) -> bool:
+        return Path(filename).suffix.lower() in Config.ALLOWED_EXTENSIONS
+
+    @staticmethod
+    def validate_required_columns(df: pd.DataFrame, required_columns: List[str]) -> bool:
+        return all(col in df.columns for col in required_columns)
+
+    @staticmethod
+    def validate_data_sufficiency(series: pd.Series) -> bool:
+        return len(series.dropna()) >= Config.MIN_DATA_POINTS
+
+
+# --- Utilitários ---
+class DataUtils:
+    @staticmethod
+    def parse_semester_to_timestamp(value: Union[str, float]) -> Optional[pd.Timestamp]:
+        if isinstance(value, str) and '-' in value:
+            try:
+                return pd.to_datetime(value)
+            except ValueError:
+                return None
+        try:
+            year, semester = map(int, str(value).split('.'))
+            month = 1 if semester == 1 else 7
+            return pd.Timestamp(year=year, month=month, day=1)
+        except (ValueError, AttributeError) as e:
+            logger.warning(f"Erro ao converter semestre {value}: {e}")
+            return None
+
+    @staticmethod
+    def clean_percentage_column(series: pd.Series) -> pd.Series:
+        if series.dtype == 'object':
+            series = series.astype(str).str.replace('%', '').str.replace(',', '.')
+        return pd.to_numeric(series, errors='coerce')
+
+    @staticmethod
+    def safe_json_serialize(obj: Any) -> Any:
+        if isinstance(obj, pd.Timestamp):
+            return obj.strftime('%Y-%m-%d')
+        elif hasattr(obj, 'tolist'):
+            return obj.tolist()
+        return obj
+
+
+# --- Classe Principal de Análise ---
 class EvasionAnalyzer:
     def __init__(self):
-        self.data: Optional[pd.DataFrame] = None  # Stores the full cleaned DataFrame
-        self.processed_data: Dict[str, pd.DataFrame] = {}  # Stores filtered/aggregated DataFrames
+        self.column_mapping = {
+            'Unidade': 'unidade_academica',
+            'Semestre': 'semestre',
+            'Taxa de Evasão': 'taxa_evasao',
+            'Unidade Academica': 'unidade_academica'
+        }
+        self.required_columns = ['unidade_academica', 'semestre', 'taxa_evasao']
 
-    def parse_semester_to_timestamp(self, value: str) -> pd.Timestamp:
-        """
-        Converts semester format (YYYY.S) to timestamp.
-        """
+    def load_and_clean_data(self, file_path: Optional[str] = None,
+                            json_data: Optional[Dict] = None) -> pd.DataFrame:
         try:
-            value = str(value)
-            year, semester = value.split('.')
-            year = int(year)
-            month = 1 if int(semester) == 1 else 7  # Jan for S1, Jul for S2
-            return pd.Timestamp(year=year, month=month, day=1)
-        except Exception as e:
-            raise ValueError(f"Erro ao converter semestre '{value}': {e}")
-
-    def load_and_clean_data(self, csv_content: str) -> pd.DataFrame:
-        """
-        Loads and cleans data from CSV content string.
-        Performs initial cleaning and type conversion, sets index, but DOES NOT apply asfreq yet.
-        """
-        try:
-            df = pd.read_csv(io.StringIO(csv_content))
-
-            units_to_remove = ['Temporário', 'Itapagé']
-            df = df[~df['Unidade'].isin(units_to_remove)]
-
-            columns_to_drop = ['Tx. Retenção (Prazo Padrão)',
-                               'Tx. Retenção II (Prazo Máximo)',
-                               'Matriculas']
-            df = df.drop(columns=[col for col in columns_to_drop if col in df.columns])
-
-            df.rename(columns={
-                'Taxa de Evasao': 'taxa_evasao',
-                'Taxa de Evasão': 'taxa_evasao',
-                'Semestre': 'semestre'
-            }, inplace=True)
-
-            df['semestre'] = df['semestre'].apply(self.parse_semester_to_timestamp)
-
-            if df['taxa_evasao'].dtype == 'object':
-                df['taxa_evasao'] = pd.to_numeric(
-                    df['taxa_evasao'].astype(str).str.replace('%', ''),
-                    errors='coerce'
-                )
+            if file_path:
+                df = pd.read_csv(file_path)
+            elif json_data:
+                df = pd.DataFrame(json_data['rows'], columns=json_data['headers'])
             else:
-                df['taxa_evasao'] = pd.to_numeric(df['taxa_evasao'], errors='coerce')
-
-            # Drop rows where critical columns (semestre or taxa_evasao) are NaN after conversion
-            df = df.dropna(subset=['semestre', 'taxa_evasao'])
-
-            df.set_index('semestre', inplace=True)
-            df.sort_index(inplace=True)
-
-            self.data = df
-            print("Dados carregados e limpos:")
-            print(df.head())
+                raise ValueError("É necessário fornecer file_path ou json_data")
+            df = self._clean_and_transform_data(df)
             return df
-
         except Exception as e:
-            raise Exception(f"Erro ao carregar ou limpar dados: {e}")
+            logger.error(f"Erro ao carregar dados: {e}")
+            raise DataProcessingError(f"Erro ao processar dados: {str(e)}")
 
-    def filter_by_unit(self, df_full: pd.DataFrame, unit_name: str) -> pd.DataFrame:
-        """
-        Filters data for a specific unit - REMOVIDO asfreq problemático.
-        """
-        temp_df = df_full.reset_index()  # Reset index to filter by 'Unidade'
-        filtered_df = temp_df[temp_df['Unidade'] == unit_name].copy()
+    def _clean_and_transform_data(self, df: pd.DataFrame) -> pd.DataFrame:
+        df = df.rename(columns=self.column_mapping)
+        if not DataValidator.validate_required_columns(df, self.required_columns):
+            missing_cols = set(self.required_columns) - set(df.columns)
+            raise DataProcessingError(f"Colunas obrigatórias ausentes: {missing_cols}.")
+        df['semestre'] = df['semestre'].apply(DataUtils.parse_semester_to_timestamp)
+        df['taxa_evasao'] = DataUtils.clean_percentage_column(df['taxa_evasao'])
+        df = df.dropna(subset=['semestre', 'taxa_evasao'])
+        df = df.set_index('semestre').sort_index()
+        return df
 
-        if filtered_df.empty:
-            return pd.DataFrame()
-
-        filtered_df = filtered_df.drop(columns=['Unidade'])
-        filtered_df.set_index('semestre', inplace=True)
-
-        # Handle potential duplicates in index after filtering
-        if not filtered_df.index.is_unique:
-            filtered_df = filtered_df[~filtered_df.index.duplicated(keep='first')]
-
-        filtered_df.sort_index(inplace=True)
-
-        # REMOVIDO: asfreq e interpolate que causavam problemas
-        # filtered_df = filtered_df.asfreq('6M', fill_value=np.nan).interpolate(method='linear')
-
-        self.processed_data[unit_name] = filtered_df
-        print(f"Dados filtrados para {unit_name}:")
-        print(filtered_df.head())
-        return filtered_df
-
-    def aggregate_by_semester(self, df_full: pd.DataFrame) -> pd.DataFrame:
-        """
-        Aggregates data by semester (sum total) - REMOVIDO asfreq problemático.
-        """
-        temp_df = df_full.drop(columns=['Unidade'] if 'Unidade' in df_full.columns else [], errors='ignore')
-        aggregated = temp_df.groupby(temp_df.index).sum(numeric_only=True)
-
-        # REMOVIDO: asfreq e interpolate que causavam problemas
-        # aggregated = aggregated.asfreq('6ME', fill_value=np.nan).interpolate(method='linear')
-
-        self.processed_data['agregado'] = aggregated
-        print("Dados agregados:")
-        print(aggregated.head())
-        return aggregated
-
-    def generate_and_save_decomposition_plot(self, data_series: pd.Series, filename: str):
-        """
-        Generates and saves the time series decomposition plot.
-        Receives a pd.Series (taxa_evasao).
-        """
-        print(f"Série para decomposição {filename}:")
-        print(data_series.head())
-        print(f"Valores não-nulos: {data_series.count()}")
-
-        if data_series.empty:
-            print(f"Série vazia para decomposição: {filename}")
-            return  # Don't raise error, just skip plot generation
-
-        # Drop NaNs before decomposition as it requires non-missing values
-        series_clean = data_series.dropna()
-        if series_clean.empty:
-            print(f"Série vazia após remover NaNs para decomposição: {filename}")
-            return
-        if len(series_clean) < 4:  # At least 4 points for decomposition
-            print(f"Série muito curta para decomposição: {filename}. Mínimo 4 pontos, tem {len(series_clean)}")
-            return
-
-        # Ajuste de período para seasonal_decompose (2 para semestral)
+    def perform_analysis(self, data_series: pd.Series, semestre_corte_str: Optional[str] = None) -> Dict[str, Any]:
+        """Executa análise completa, separando treino e teste."""
         try:
-            decomposition = seasonal_decompose(
-                series_clean,
-                model='additive',
-                period=2
-            )
+            clean_series = data_series.dropna()
+            if not DataValidator.validate_data_sufficiency(clean_series):
+                raise InsufficientDataError(
+                    f"Dados insuficientes. Mínimo: {Config.MIN_DATA_POINTS}, atual: {len(clean_series)}")
+
+            train_series = clean_series
+            test_series = None
+            if semestre_corte_str:
+                semestre_corte_ts = DataUtils.parse_semester_to_timestamp(semestre_corte_str)
+                if semestre_corte_ts and semestre_corte_ts in clean_series.index:
+                    train_series = clean_series[clean_series.index <= semestre_corte_ts]
+                    test_series = clean_series[clean_series.index > semestre_corte_ts]
+
+            if not DataValidator.validate_data_sufficiency(train_series):
+                raise InsufficientDataError("Dados de treino insuficientes após o corte.")
+
+            results = {
+                'decomposition': self._perform_decomposition(train_series),
+                'forecast': self._perform_forecast(train_series, test_series),
+                'statistics': self._calculate_statistics(train_series),
+                'autocorrelation': self._perform_autocorrelation(train_series)
+            }
+            logger.info("Análise concluída com sucesso")
+            return results
+        except InsufficientDataError:
+            raise
         except Exception as e:
-            print(f"Erro na decomposição sazonal para {filename}: {e}. Skipping plot.")
-            return
+            logger.error(f"Erro na análise: {e}")
+            raise DataProcessingError(f"Erro durante análise: {str(e)}")
 
-        fig, axes = plt.subplots(4, 1, figsize=(10, 12), sharex=True)
-
-        # Plotar com datas no eixo X
-        decomposition.observed.plot(ax=axes[0], title='Série Original', color='blue')
-        decomposition.trend.plot(ax=axes[1], title='Tendência', color='green')
-        decomposition.seasonal.plot(ax=axes[2], title='Sazonalidade', color='orange')
-        decomposition.resid.plot(ax=axes[3], title='Resíduos', color='red')
-
-        for ax in axes:
-            ax.grid(True, linestyle='--', alpha=0.6)
-            ax.tick_params(axis='x', rotation=45)
-            ax.set_xlabel('')
-            ax.set_ylabel('Taxa (%)')
-
-        plt.suptitle("Decomposição da Série Temporal", y=1.02, fontsize=16)
-        plt.tight_layout(rect=[0, 0.03, 1, 0.98])
-        plt.savefig(os.path.join(IMAGE_DIR, filename), bbox_inches='tight', dpi=150)
-        plt.close(fig)
-
-    def generate_and_save_acf_pacf_plot(self, data_series: pd.Series, filename: str):
-        """
-        Generates and saves ACF and PACF plots.
-        Receives a pd.Series (taxa_evasao).
-        """
-        print(f"Série para ACF/PACF {filename}:")
-        print(data_series.head())
-        print(f"Valores não-nulos: {data_series.count()}")
-
-        if data_series.empty:
-            print(f"Série vazia para ACF/PACF: {filename}")
-            return
-
-        series_clean = data_series.dropna()
-        if series_clean.empty:
-            print(f"Série vazia após remover NaNs para ACF/PACF: {filename}")
-            return
-
-        # Calcula o número máximo de lags, evitando erro se a série for muito curta
-        lags = min(len(series_clean) // 2 - 1, 10)  # Máximo de 10 lags como no protótipo
-
-        if lags < 1:
-            print(f"Série muito curta para ACF/PACF: {filename}. Lags={lags}. Mínimo 2 pontos.")
-            return
-
-        fig, axes = plt.subplots(2, 1, figsize=(10, 8))
-
-        # ACF
-        plot_acf(series_clean, lags=lags, ax=axes[0], title='Autocorrelação (ACF)')
-        axes[0].grid(True, linestyle='--', alpha=0.6)
-        axes[0].set_ylim([-1, 1])
-
-        # PACF
-        plot_pacf(series_clean, lags=lags, ax=axes[1], title='Autocorrelação Parcial (PACF)')
-        axes[1].grid(True, linestyle='--', alpha=0.6)
-        axes[1].set_ylim([-1, 1])
-
-        plt.tight_layout()
-        plt.savefig(os.path.join(IMAGE_DIR, filename), bbox_inches='tight', dpi=150)
-        plt.close(fig)
-
-    def generate_and_save_prediction_plot(self, data_series: pd.Series, filename: str,
-                                          order: Tuple[int, int, int] = (1, 1, 1),  # Ordem mais simples
-                                          forecast_steps: int = 4):  # Menos passos de previsão
-        """
-        Generates and saves the Prediction plot using ARIMA model.
-        Receives a pd.Series (taxa_evasao).
-        """
-        print(f"Série para previsão {filename}:")
-        print(data_series.head())
-        print(f"Valores não-nulos: {data_series.count()}")
-
-        if data_series.empty:
-            print(f"Série vazia para previsão: {filename}")
-            return
-
-        series_clean = data_series.dropna()
-        min_points = max(sum(order) + 2, 5)  # Mínimo mais conservador
-
-        if len(series_clean) < min_points:
-            print(
-                f"Série muito curta para previsão ARIMA: {filename}. Tamanho={len(series_clean)}. Mínimo {min_points} pontos.")
-            return
-
+    def _perform_decomposition(self, series: pd.Series) -> Optional[Dict[str, Any]]:
         try:
-            model = StatsARIMA(series_clean, order=order)
-            model_fit = model.fit()
-
-            # Predict into the future `forecast_steps`
-            forecast_results = model_fit.get_forecast(steps=forecast_steps)
-            y_pred = forecast_results.predicted_mean
-            conf_int = forecast_results.conf_int(alpha=0.05)
-
-            plt.figure(figsize=(12, 7))
-
-            # Plot original series
-            plt.plot(series_clean.index, series_clean, label="Série Original", color='blue', linewidth=2)
-
-            # Plot prediction
-            plt.plot(y_pred.index, y_pred, label="Previsão", color='red', linestyle='--', linewidth=2)
-
-            # Confidence Interval
-            plt.fill_between(
-                y_pred.index,
-                conf_int.iloc[:, 0],
-                conf_int.iloc[:, 1],
-                color='gray',
-                alpha=0.2,
-                label="IC 95%"
-            )
-
-            plt.title("Previsão de Taxa de Evasão")
-            plt.xlabel("Semestre")
-            plt.ylabel("Taxa de Evasão (%)")
-            plt.legend()
-            plt.grid(True, linestyle='--', alpha=0.6)
-            plt.tight_layout()
-            plt.savefig(os.path.join(IMAGE_DIR, filename), bbox_inches='tight', dpi=150)
-            plt.close()
-
+            period = min(2, len(series) // 2) if len(series) >= 4 else 2
+            decomposition = seasonal_decompose(series, model='additive', period=period)
+            return {
+                "trend": {"x": [DataUtils.safe_json_serialize(x) for x in decomposition.trend.dropna().index],
+                          "y": decomposition.trend.dropna().values.tolist()},
+                "seasonal": {"x": [DataUtils.safe_json_serialize(x) for x in decomposition.seasonal.index],
+                             "y": decomposition.seasonal.values.tolist()},
+                "residual": {"x": [DataUtils.safe_json_serialize(x) for x in decomposition.resid.dropna().index],
+                             "y": decomposition.resid.dropna().values.tolist()}
+            }
         except Exception as e:
-            print(f"Erro na previsão ARIMA para {filename}: {e}. Skipping plot.")
-            # Do not re-raise to avoid breaking the API endpoint for other plots
+            logger.warning(f"Erro na decomposição: {e}")
+            return None
 
-
-# ====================================================================
-# FIM DO CÓDIGO DA CLASSE EVASIONANALYZER
-# ====================================================================
-
-
-@app.route('/analyze', methods=['POST'])
-def analyze_data():
-    try:
-        request_data = request.get_json()
-        if not request_data:
-            return jsonify({'error': 'Requisição JSON inválida.'}), 400
-
-        csv_content_b64 = request_data.get('fileContent')
-        # Filters are now expected as a list of unit names (e.g., ['QUIXADÁ'])
-        filters = request_data.get('filters', [])
-        max_semester = request_data.get('maxSemester')  # Semestre máximo para treinar (e.g., '2019.1')
-
-        if not csv_content_b64:
-            return jsonify({'error': 'Conteúdo do arquivo CSV não fornecido.'}), 400
-
-        csv_content = base64.b64decode(csv_content_b64).decode('utf-8')
-
-        analyzer = EvasionAnalyzer()
-
-        df_full = analyzer.load_and_clean_data(csv_content)
-
-        if df_full.empty:
-            return jsonify({'error': 'Não foi possível carregar ou processar os dados do CSV.'}), 400
-
-        # Determine the series to use for plotting based on filters
-        data_series_for_plots: pd.Series
-
-        if filters:
-            # Assuming 'Unidade' column exists in df_full
-            # Filter df_full by selected units first, then aggregate for the series
-            if 'Unidade' in df_full.columns:
-                df_filtered_by_units = df_full[df_full['Unidade'].isin(filters)].copy()
-                if df_filtered_by_units.empty:
-                    return jsonify(
-                        {'error': f"Nenhum dado encontrado para as unidades filtradas: {', '.join(filters)}"}), 400
-
-                # Aggregate across selected units for the analysis series
-                data_series_for_plots = df_filtered_by_units.groupby(df_filtered_by_units.index)[
-                    'taxa_evasao'].mean()  # Using mean for multiple units
-
-                print("Série filtrada e agregada:")
-                print(data_series_for_plots.head())
-
+    def _perform_forecast(self, train_series: pd.Series, test_series: Optional[pd.Series] = None) -> Optional[Dict[str, Any]]:
+        try:
+            numeric_series = pd.Series(train_series.values, index=range(len(train_series)))
+            model = AutoARIMA(seasonal=False, stepwise=True, suppress_warnings=True, max_p=3, max_q=3, max_d=2)
+            model.fit(numeric_series)
+            results = {
+                "original_x": [DataUtils.safe_json_serialize(x) for x in train_series.index],
+                "original_y": train_series.values.tolist(),
+                "test_x": [], "test_y": [],
+                "forecast_x": [], "forecast_y": [],
+                "mape": None
+            }
+            if test_series is not None and not test_series.empty:
+                n_test_points = len(test_series)
+                forecast_values = model.predict(fh=list(range(1, n_test_points + 1)))
+                mape = mean_absolute_percentage_error(test_series.values, forecast_values.values) * 100
+                results.update({
+                    "test_x": [DataUtils.safe_json_serialize(x) for x in test_series.index],
+                    "test_y": test_series.values.tolist(),
+                    "forecast_x": [DataUtils.safe_json_serialize(x) for x in test_series.index],
+                    "forecast_y": forecast_values.values.tolist(),
+                    "mape": float(mape)
+                })
             else:
-                warnings.warn(
-                    "Coluna 'Unidade' não encontrada no DataFrame para aplicar filtros. Usando dados agregados.")
-                data_series_for_plots = analyzer.aggregate_by_semester(df_full)['taxa_evasao']
-        else:
-            # If no units are selected for filtering, use the overall aggregated data
-            aggregated_df = analyzer.aggregate_by_semester(df_full)
-            if aggregated_df.empty or 'taxa_evasao' not in aggregated_df.columns:
-                return jsonify(
-                    {'error': 'Não foi possível agregar dados por semestre ou coluna taxa_evasao não encontrada.'}), 400
-            data_series_for_plots = aggregated_df['taxa_evasao']
+                forecast_values = model.predict(fh=[1, 2, 3, 4])
+                last_date = train_series.index[-1]
+                forecast_dates = []
+                current_date = last_date
+                for i in range(4):
+                    if current_date.month == 1:
+                        next_date = current_date.replace(month=7)
+                    else:
+                        next_date = current_date.replace(year=current_date.year + 1, month=1)
+                    forecast_dates.append(next_date)
+                    current_date = next_date
+                results.update({
+                    "forecast_x": [DataUtils.safe_json_serialize(x) for x in forecast_dates],
+                    "forecast_y": forecast_values.values.tolist()
+                })
+            return results
+        except Exception as e:
+            logger.error(f"Erro na previsão: {e}\n{traceback.format_exc()}")
+            return None
 
-        # Apply max_semester filter to the selected series
-        if max_semester:
-            try:
-                max_sem_ts = analyzer.parse_semester_to_timestamp(max_semester)
-                data_series_for_plots = data_series_for_plots[data_series_for_plots.index <= max_sem_ts].copy()
-                if data_series_for_plots.empty:
-                    return jsonify({'error': f"Nenhum dado após o filtro de semestre máximo: {max_semester}"}), 400
-            except ValueError as e:
-                print(f"Aviso: Semestre máximo inválido: {e}. Ignorando filtro de semestre.")
-
-        # Final check before passing to plot functions
-        if data_series_for_plots.empty:
-            return jsonify({'error': 'Nenhum dado válido para gerar os gráficos após todos os filtros.'}), 400
-
-        print("Série final para análise:")
-        print(data_series_for_plots.head())
-        print(f"Total de valores: {len(data_series_for_plots)}")
-        print(f"Valores não-nulos: {data_series_for_plots.count()}")
-
-        # --- Salvar os gráficos como imagens ---
-        import uuid
-        analysis_id = str(uuid.uuid4())  # Unique ID for this analysis
-
-        decomposition_image_name = f'decomposicao_{analysis_id}.png'
-        acf_pacf_image_name = f'acf_pacf_{analysis_id}.png'
-        prediction_image_name = f'predicao_{analysis_id}.png'
-
-        analyzer.generate_and_save_decomposition_plot(data_series_for_plots, decomposition_image_name)
-        analyzer.generate_and_save_acf_pacf_plot(data_series_for_plots, acf_pacf_image_name)
-        analyzer.generate_and_save_prediction_plot(data_series_for_plots, prediction_image_name)
-
-        # --- Retornar as URLs das imagens geradas ---
-        response_data = {
-            "image_urls": {
-                "decomposicao": f"/images/{decomposition_image_name}",
-                "acf_pacf": f"/images/{acf_pacf_image_name}",
-                "predicao": f"/images/{prediction_image_name}",
-            },
-            "message": "Análise e geração de imagens concluídas com sucesso!"
+    def _calculate_statistics(self, series: pd.Series) -> Dict[str, float]:
+        return {
+            "mean": float(series.mean()), "std": float(series.std()),
+            "min": float(series.min()), "max": float(series.max()),
+            "trend": float(series.iloc[-1] - series.iloc[0]) if len(series) > 1 else 0.0
         }
 
-        return jsonify(response_data), 200
+    def _perform_autocorrelation(self, series: pd.Series) -> Optional[Dict[str, Any]]:
+        try:
+            nlags = min(10, len(series) // 2 - 1)
+            if nlags <= 0: return None
+            acf_values, acf_confint = acf(series, nlags=nlags, alpha=0.05)
+            pacf_values, pacf_confint = pacf(series, nlags=nlags, alpha=0.05)
+            acf_confint_upper = acf_confint[:, 1] - acf_values
+            pacf_confint_upper = pacf_confint[:, 1] - pacf_values
+            return {
+                "lags": list(range(len(acf_values))),
+                "acf": acf_values.tolist(), "pacf": pacf_values.tolist(),
+                "acf_confidence_upper": acf_confint_upper.tolist(),
+                "pacf_confidence_upper": pacf_confint_upper.tolist(),
+            }
+        except Exception as e:
+            logger.warning(f"Erro no cálculo de autocorrelação: {e}")
+            return None
 
+
+# --- Handlers de Erro ---
+@app.errorhandler(413)
+def file_too_large(error): return jsonify({"error": "Arquivo muito grande. Máximo: 16MB"}), 413
+@app.errorhandler(DataProcessingError)
+def handle_data_processing_error(error): return jsonify({"error": str(error)}), 400
+@app.errorhandler(InsufficientDataError)
+def handle_insufficient_data_error(error): return jsonify({"error": str(error)}), 400
+
+
+# --- Endpoints ---
+@app.route("/api/upload", methods=["POST"])
+def upload_file():
+    try:
+        if 'file' not in request.files: return jsonify({"error": "Nenhum arquivo enviado"}), 400
+        file = request.files['file']
+        if not file.filename or not DataValidator.validate_file_extension(file.filename):
+            return jsonify({"error": "Arquivo inválido ou não é CSV"}), 400
+        file_id = str(uuid.uuid4())
+        filepath = Config.UPLOAD_FOLDER / f"{file_id}.csv"
+        file.save(str(filepath))
+        logger.info(f"Arquivo {file.filename} salvo como {file_id}")
+        return jsonify({"fileId": file_id, "fileName": file.filename}), 201
     except Exception as e:
-        print(f"Erro na execução da análise: {e}")
-        return jsonify({'error': str(e)}), 500
+        logger.error(f"Erro no upload: {e}")
+        return jsonify({"error": "Erro interno do servidor"}), 500
 
 
-# --- Rota para servir as imagens estáticas ---
-@app.route('/images/<path:filename>')
-def serve_image(filename):
-    """
-    Serves static files from the IMAGE_DIR directory.
-    """
-    return send_from_directory(IMAGE_DIR, filename)
+@app.route("/api/files/<file_id>/details", methods=["GET"])
+def get_file_details(file_id: str):
+    try:
+        filepath = Config.UPLOAD_FOLDER / f"{file_id}.csv"
+        if not filepath.exists(): return jsonify({"error": "Arquivo não encontrado"}), 404
+        analyzer = EvasionAnalyzer()
+        df = analyzer.load_and_clean_data(file_path=str(filepath))
+        unidades = df['unidade_academica'].unique().tolist() if 'unidade_academica' in df.columns else []
+        semestres = df.index.to_series().apply(lambda x: f"{x.year}.{1 if x.month == 1 else 2}").unique().tolist()
+        preview_df = df.reset_index().head(100)
+        preview_data = {"headers": preview_df.columns.tolist(), "rows": preview_df.astype(str).values.tolist()}
+        file_details = FileDetails(unidades=sorted(unidades), semestres=sorted(semestres), preview_data=preview_data)
+        return jsonify(file_details.__dict__), 200
+    except DataProcessingError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        logger.error(f"Erro ao obter detalhes: {e}")
+        return jsonify({"error": "Erro interno do servidor"}), 500
 
 
+@app.route("/api/analysis", methods=["POST"])
+def perform_analysis_route():
+    try:
+        payload = request.get_json()
+        if not payload: return jsonify({"error": "Payload JSON inválido"}), 400
+        params = AnalysisParams(
+            selected_unidades=payload.get('params', {}).get('selectedUnidades'),
+            selected_semestre=payload.get('params', {}).get('selectedSemestre')
+        )
+        edited_data = payload.get('data')
+        if not edited_data: return jsonify({"error": "Dados para análise não fornecidos"}), 400
+        analyzer = EvasionAnalyzer()
+        df = analyzer.load_and_clean_data(json_data=edited_data)
+        if 'unidade_academica' in df.columns and params.selected_unidades:
+            df_filtered = df[df['unidade_academica'].isin(params.selected_unidades)]
+        else:
+            df_filtered = df
+        time_series = df_filtered.groupby(df_filtered.index)['taxa_evasao'].mean()
+        analysis_results = analyzer.perform_analysis(
+            data_series=time_series,
+            semestre_corte_str=params.selected_semestre
+        )
+        logger.info("Análise concluída com sucesso")
+        return jsonify(analysis_results), 200
+    except (DataProcessingError, InsufficientDataError) as e:
+        raise e
+    except Exception as e:
+        logger.error(f"Erro na análise: {e}")
+        traceback.print_exc()
+        return jsonify({"error": "Erro interno do servidor"}), 500
+
+@app.route('/api/health', methods=['GET'])
+def health_check():
+    return jsonify({"status": "healthy", "timestamp": datetime.now().isoformat(), "version": "2.1"})
+
+
+# --- Execução ---
 if __name__ == '__main__':
-    # Ensure the image directory exists when running locally
-    if not os.path.exists(IMAGE_DIR):
-        os.makedirs(IMAGE_DIR)
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    app.run(host='0.0.0.0', port=5000, debug=True)

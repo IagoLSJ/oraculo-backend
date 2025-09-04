@@ -1,8 +1,8 @@
-Flask
-Flask-Cors
 pandas
-numpy
+flask
+flask-cors
 matplotlib
-sktime
-gunicorn
 statsmodels
+sktime
+numpy
+scikit-learn
