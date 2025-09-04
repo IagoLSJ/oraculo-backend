@@ -7,3 +7,4 @@ sktime
 numpy
 scikit-learn
 gunicorn
+pmdarima
