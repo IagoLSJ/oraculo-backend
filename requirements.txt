@@ -6,3 +6,4 @@ statsmodels
 sktime
 numpy
 scikit-learn
+gunicorn
