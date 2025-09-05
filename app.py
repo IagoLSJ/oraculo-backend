@@ -183,9 +183,14 @@ class EvasionAnalyzer:
 
     def _perform_decomposition(self, series: pd.Series) -> Optional[Dict[str, Any]]:
         try:
-            period = min(2, len(series) // 2) if len(series) >= 4 else 2
+            # Garante que o período seja no mínimo 2 e no máximo metade do tamanho da série
+            period = 2 if len(series) < 4 else max(2, len(series) // 2)
             decomposition = seasonal_decompose(series, model='additive', period=period)
+
+            # AJUSTE: Incluindo a série original na resposta para o frontend
             return {
+                "original": {"x": [DataUtils.safe_json_serialize(x) for x in series.index],
+                             "y": series.values.tolist()},
                 "trend": {"x": [DataUtils.safe_json_serialize(x) for x in decomposition.trend.dropna().index],
                           "y": decomposition.trend.dropna().values.tolist()},
                 "seasonal": {"x": [DataUtils.safe_json_serialize(x) for x in decomposition.seasonal.index],
@@ -197,44 +202,67 @@ class EvasionAnalyzer:
             logger.warning(f"Erro na decomposição: {e}")
             return None
 
-    def _perform_forecast(self, train_series: pd.Series, test_series: Optional[pd.Series] = None) -> Optional[Dict[str, Any]]:
+    def _perform_forecast(self, train_series: pd.Series, test_series: Optional[pd.Series] = None) -> Optional[
+        Dict[str, Any]]:
         try:
-            numeric_series = pd.Series(train_series.values, index=range(len(train_series)))
+            # O AutoARIMA da sktime funciona melhor com um índice numérico simples
+            numeric_train_series = pd.Series(train_series.values, index=pd.RangeIndex(len(train_series)))
+
             model = AutoARIMA(seasonal=False, stepwise=True, suppress_warnings=True, max_p=3, max_q=3, max_d=2)
-            model.fit(numeric_series)
+            model.fit(numeric_train_series)
+
             results = {
                 "original_x": [DataUtils.safe_json_serialize(x) for x in train_series.index],
                 "original_y": train_series.values.tolist(),
                 "test_x": [], "test_y": [],
                 "forecast_x": [], "forecast_y": [],
+                "forecast_ci_lower": [], "forecast_ci_upper": [],  # AJUSTE: Adicionado para o frontend
                 "mape": None
             }
+
             if test_series is not None and not test_series.empty:
                 n_test_points = len(test_series)
-                forecast_values = model.predict(fh=list(range(1, n_test_points + 1)))
+                fh = list(range(1, n_test_points + 1))
+
+                # AJUSTE: Usando predict_interval para obter os intervalos de confiança
+                pred_interval = model.predict_interval(fh=fh, coverage=0.95)
+                forecast_values = pred_interval.iloc[:, 0]  # A primeira coluna é a previsão
+
                 mape = mean_absolute_percentage_error(test_series.values, forecast_values.values) * 100
+
                 results.update({
                     "test_x": [DataUtils.safe_json_serialize(x) for x in test_series.index],
                     "test_y": test_series.values.tolist(),
                     "forecast_x": [DataUtils.safe_json_serialize(x) for x in test_series.index],
                     "forecast_y": forecast_values.values.tolist(),
+                    "forecast_ci_lower": pred_interval.iloc[:, 1].values.tolist(),  # Segunda coluna é o limite inferior
+                    "forecast_ci_upper": pred_interval.iloc[:, 2].values.tolist(),
+                    # Terceira coluna é o limite superior
                     "mape": float(mape)
                 })
             else:
-                forecast_values = model.predict(fh=[1, 2, 3, 4])
+                fh = [1, 2, 3, 4]  # Prever 4 períodos no futuro
+
+                # AJUSTE: Usando predict_interval também para o caso sem teste
+                pred_interval = model.predict_interval(fh=fh, coverage=0.95)
+                forecast_values = pred_interval.iloc[:, 0]
+
                 last_date = train_series.index[-1]
                 forecast_dates = []
                 current_date = last_date
-                for i in range(4):
+                for _ in range(4):
                     if current_date.month == 1:
                         next_date = current_date.replace(month=7)
                     else:
                         next_date = current_date.replace(year=current_date.year + 1, month=1)
                     forecast_dates.append(next_date)
                     current_date = next_date
+
                 results.update({
                     "forecast_x": [DataUtils.safe_json_serialize(x) for x in forecast_dates],
-                    "forecast_y": forecast_values.values.tolist()
+                    "forecast_y": forecast_values.values.tolist(),
+                    "forecast_ci_lower": pred_interval.iloc[:, 1].values.tolist(),
+                    "forecast_ci_upper": pred_interval.iloc[:, 2].values.tolist(),
                 })
             return results
         except Exception as e:
@@ -270,8 +298,12 @@ class EvasionAnalyzer:
 # --- Handlers de Erro ---
 @app.errorhandler(413)
 def file_too_large(error): return jsonify({"error": "Arquivo muito grande. Máximo: 16MB"}), 413
+
+
 @app.errorhandler(DataProcessingError)
 def handle_data_processing_error(error): return jsonify({"error": str(error)}), 400
+
+
 @app.errorhandler(InsufficientDataError)
 def handle_insufficient_data_error(error): return jsonify({"error": str(error)}), 400
 
@@ -339,15 +371,17 @@ def perform_analysis_route():
         logger.info("Análise concluída com sucesso")
         return jsonify(analysis_results), 200
     except (DataProcessingError, InsufficientDataError) as e:
-        raise e
+        raise e  # Deixa os handlers de erro customizados capturarem
     except Exception as e:
         logger.error(f"Erro na análise: {e}")
         traceback.print_exc()
         return jsonify({"error": "Erro interno do servidor"}), 500
 
+
 @app.route('/api/health', methods=['GET'])
 def health_check():
-    return jsonify({"status": "healthy", "timestamp": datetime.now().isoformat(), "version": "2.1"})
+    # AJUSTE: Versão atualizada para refletir as mudanças
+    return jsonify({"status": "healthy", "timestamp": datetime.now().isoformat(), "version": "2.2"})
 
 
 # --- Execução ---
