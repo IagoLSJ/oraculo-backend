@@ -14,7 +14,7 @@ import traceback
 from datetime import datetime
 import numpy as np
 from sklearn.metrics import mean_absolute_percentage_error
-# IMPORTAÇÕES PARA GERAR GRÁFICOS
+
 import matplotlib.pyplot as plt
 import matplotlib
 
@@ -227,7 +227,7 @@ class EvasionAnalyzer:
         try:
             fig, ax = plt.subplots(figsize=(12, 6))
             ax.set_title('Previsão da Taxa de Evasão', fontsize=16)
-            print(train_series)
+
             # Dados de treino
             ax.plot(train_series.index, train_series.values,
                     label='Treino', marker='o', linewidth=2, color='blue')
@@ -303,9 +303,9 @@ class EvasionAnalyzer:
             # Gerar ID único para esta análise se não fornecido
             if analysis_id is None:
                 analysis_id = str(uuid.uuid4())[:8]
-            print(data_series)
+
             clean_series = data_series.dropna()
-            print(clean_series)
+
             if not DataValidator.validate_data_sufficiency(clean_series):
                 raise InsufficientDataError(
                     f"Dados insuficientes. Mínimo: {Config.MIN_DATA_POINTS}, atual: {len(clean_series)}")
@@ -542,7 +542,7 @@ def perform_analysis_route():
 
         analyzer = EvasionAnalyzer()
         df = analyzer.load_and_clean_data(json_data=edited_data)
-        print(df)
+
         df_filtered = df
         if 'unidade_academica' in df.columns and params.selected_unidades:
             df_filtered = df[df['unidade_academica'].isin(params.selected_unidades)]
