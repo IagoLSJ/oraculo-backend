@@ -156,144 +156,144 @@ class EvasionAnalyzer:
         return df
 
     # --- MÉTODOS PARA SALVAR GRÁFICOS EM PASTA ---
-    def _save_plot_to_file(self, fig, filename: str) -> str:
-        """Salva uma figura matplotlib como arquivo PNG e retorna o caminho."""
-        filepath = Config.IMAGES_FOLDER / f"{filename}.png"
-        fig.savefig(str(filepath), format='png', bbox_inches='tight', dpi=300)
-        plt.close(fig)
-        logger.info(f"Gráfico salvo em: {filepath}")
-        return str(filepath)
-
-    def _generate_unique_filename(self, base_name: str, analysis_id: str) -> str:
-        """Gera um nome único para o arquivo baseado no ID da análise."""
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        return f"{analysis_id}_{base_name}_{timestamp}"
-
-    def _generate_decomposition_plot(self, series: pd.Series, decomposition_result: Dict[str, Any], analysis_id: str) -> \
-    Optional[str]:
-        """Gera o gráfico de decomposição e salva na pasta."""
-        try:
-            fig, axs = plt.subplots(4, 1, figsize=(12, 10), sharex=True)
-            fig.suptitle('Decomposição da Série Temporal', fontsize=16)
-
-            # Série Original
-            axs[0].plot(series.index, series.values, label='Original', color='blue', linewidth=2)
-            axs[0].set_ylabel('Taxa (%)')
-            axs[0].legend()
-            axs[0].grid(True, alpha=0.3)
-
-            # Tendência
-            if decomposition_result and 'trend' in decomposition_result:
-                trend_x = pd.to_datetime(decomposition_result['trend']['x'])
-                axs[1].plot(trend_x, decomposition_result['trend']['y'],
-                            label='Tendência', color='orange', linewidth=2)
-                axs[1].set_ylabel('Tendência')
-                axs[1].legend()
-                axs[1].grid(True, alpha=0.3)
-
-            # Sazonalidade
-            if decomposition_result and 'seasonal' in decomposition_result:
-                seasonal_x = pd.to_datetime(decomposition_result['seasonal']['x'])
-                axs[2].plot(seasonal_x, decomposition_result['seasonal']['y'],
-                            label='Sazonalidade', color='green', linewidth=2)
-                axs[2].set_ylabel('Sazonalidade')
-                axs[2].legend()
-                axs[2].grid(True, alpha=0.3)
-
-            # Resíduos
-            if decomposition_result and 'residual' in decomposition_result:
-                residual_x = pd.to_datetime(decomposition_result['residual']['x'])
-                axs[3].scatter(residual_x, decomposition_result['residual']['y'],
-                               label='Resíduos', color='red', alpha=0.7)
-                axs[3].axhline(0, color='grey', linestyle='--', alpha=0.8)
-                axs[3].set_ylabel('Resíduos')
-                axs[3].set_xlabel('Semestre')
-                axs[3].legend()
-                axs[3].grid(True, alpha=0.3)
-
-            plt.xticks(rotation=45)
-            plt.tight_layout(rect=[0, 0, 1, 0.96])
-
-            filename = self._generate_unique_filename("decomposicao", analysis_id)
-            return self._save_plot_to_file(fig, filename)
-
-        except Exception as e:
-            logger.warning(f"Erro ao gerar gráfico de decomposição: {e}")
-            return None
-
-    def _generate_forecast_plot(self, train_series: pd.Series, forecast_result: Dict[str, Any], analysis_id: str) -> \
-    Optional[str]:
-        """Gera o gráfico de previsão e salva na pasta."""
-        try:
-            fig, ax = plt.subplots(figsize=(12, 6))
-            ax.set_title('Previsão da Taxa de Evasão', fontsize=16)
-
-            # Dados de treino
-            ax.plot(train_series.index, train_series.values,
-                    label='Treino', marker='o', linewidth=2, color='blue')
-
-            # Dados de teste (se disponível)
-            if forecast_result.get('test_x') and forecast_result.get('test_y'):
-                test_x = pd.to_datetime(forecast_result['test_x'])
-                ax.plot(test_x, forecast_result['test_y'],
-                        label='Teste', marker='o', linewidth=2, color='green')
-
-            # Previsões
-            forecast_x = pd.to_datetime(forecast_result['forecast_x'])
-            ax.plot(forecast_x, forecast_result['forecast_y'],
-                    label='Previsão', marker='s', linestyle='--', linewidth=2, color='red')
-
-            # Intervalo de confiança
-            if forecast_result.get('forecast_ci_lower') and forecast_result.get('forecast_ci_upper'):
-                lower = forecast_result['forecast_ci_lower']
-                upper = forecast_result['forecast_ci_upper']
-                ax.fill_between(forecast_x, lower, upper,
-                                color='red', alpha=0.2, label='IC 95%')
-
-            ax.legend(fontsize=12)
-            ax.grid(True, alpha=0.3)
-            ax.set_xlabel('Semestre', fontsize=12)
-            ax.set_ylabel('Taxa de Evasão (%)', fontsize=12)
-            plt.xticks(rotation=45)
-            plt.tight_layout()
-
-            filename = self._generate_unique_filename("previsao", analysis_id)
-            return self._save_plot_to_file(fig, filename)
-
-        except Exception as e:
-            logger.warning(f"Erro ao gerar gráfico de previsão: {e}")
-            return None
-
-    def _generate_autocorrelation_plot(self, series: pd.Series, autocorr_result: Dict[str, Any], analysis_id: str) -> \
-    Optional[Dict[str, str]]:
-        """Gera os gráficos de ACF e PACF e salva na pasta."""
-        try:
-            if not autocorr_result:
-                return None
-
-            from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
-
-            # Gerar ACF
-            fig_acf = plt.figure(figsize=(10, 5))
-            plot_acf(series, ax=fig_acf.gca(), lags=min(10, len(series) // 2 - 1))
-            fig_acf.gca().set_title('Função de Autocorrelação (ACF)', fontsize=14)
-            fig_acf.gca().grid(True, alpha=0.3)
-            acf_filename = self._generate_unique_filename("acf", analysis_id)
-            acf_path = self._save_plot_to_file(fig_acf, acf_filename)
-
-            # Gerar PACF
-            fig_pacf = plt.figure(figsize=(10, 5))
-            plot_pacf(series, ax=fig_pacf.gca(), lags=min(10, len(series) // 2 - 1))
-            fig_pacf.gca().set_title('Função de Autocorrelação Parcial (PACF)', fontsize=14)
-            fig_pacf.gca().grid(True, alpha=0.3)
-            pacf_filename = self._generate_unique_filename("pacf", analysis_id)
-            pacf_path = self._save_plot_to_file(fig_pacf, pacf_filename)
-
-            return {'acf_plot': acf_path, 'pacf_plot': pacf_path}
-
-        except Exception as e:
-            logger.warning(f"Erro ao gerar gráfico de autocorrelação: {e}")
-            return None
+    # def _save_plot_to_file(self, fig, filename: str) -> str:
+    #     """Salva uma figura matplotlib como arquivo PNG e retorna o caminho."""
+    #     filepath = Config.IMAGES_FOLDER / f"{filename}.png"
+    #     fig.savefig(str(filepath), format='png', bbox_inches='tight', dpi=300)
+    #     plt.close(fig)
+    #     logger.info(f"Gráfico salvo em: {filepath}")
+    #     return str(filepath)
+    #
+    # def _generate_unique_filename(self, base_name: str, analysis_id: str) -> str:
+    #     """Gera um nome único para o arquivo baseado no ID da análise."""
+    #     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    #     return f"{analysis_id}_{base_name}_{timestamp}"
+    #
+    # def _generate_decomposition_plot(self, series: pd.Series, decomposition_result: Dict[str, Any], analysis_id: str) -> \
+    # Optional[str]:
+    #     """Gera o gráfico de decomposição e salva na pasta."""
+    #     try:
+    #         fig, axs = plt.subplots(4, 1, figsize=(12, 10), sharex=True)
+    #         fig.suptitle('Decomposição da Série Temporal', fontsize=16)
+    #
+    #         # Série Original
+    #         axs[0].plot(series.index, series.values, label='Original', color='blue', linewidth=2)
+    #         axs[0].set_ylabel('Taxa (%)')
+    #         axs[0].legend()
+    #         axs[0].grid(True, alpha=0.3)
+    #
+    #         # Tendência
+    #         if decomposition_result and 'trend' in decomposition_result:
+    #             trend_x = pd.to_datetime(decomposition_result['trend']['x'])
+    #             axs[1].plot(trend_x, decomposition_result['trend']['y'],
+    #                         label='Tendência', color='orange', linewidth=2)
+    #             axs[1].set_ylabel('Tendência')
+    #             axs[1].legend()
+    #             axs[1].grid(True, alpha=0.3)
+    #
+    #         # Sazonalidade
+    #         if decomposition_result and 'seasonal' in decomposition_result:
+    #             seasonal_x = pd.to_datetime(decomposition_result['seasonal']['x'])
+    #             axs[2].plot(seasonal_x, decomposition_result['seasonal']['y'],
+    #                         label='Sazonalidade', color='green', linewidth=2)
+    #             axs[2].set_ylabel('Sazonalidade')
+    #             axs[2].legend()
+    #             axs[2].grid(True, alpha=0.3)
+    #
+    #         # Resíduos
+    #         if decomposition_result and 'residual' in decomposition_result:
+    #             residual_x = pd.to_datetime(decomposition_result['residual']['x'])
+    #             axs[3].scatter(residual_x, decomposition_result['residual']['y'],
+    #                            label='Resíduos', color='red', alpha=0.7)
+    #             axs[3].axhline(0, color='grey', linestyle='--', alpha=0.8)
+    #             axs[3].set_ylabel('Resíduos')
+    #             axs[3].set_xlabel('Semestre')
+    #             axs[3].legend()
+    #             axs[3].grid(True, alpha=0.3)
+    #
+    #         plt.xticks(rotation=45)
+    #         plt.tight_layout(rect=[0, 0, 1, 0.96])
+    #
+    #         filename = self._generate_unique_filename("decomposicao", analysis_id)
+    #         return self._save_plot_to_file(fig, filename)
+    #
+    #     except Exception as e:
+    #         logger.warning(f"Erro ao gerar gráfico de decomposição: {e}")
+    #         return None
+    #
+    # def _generate_forecast_plot(self, train_series: pd.Series, forecast_result: Dict[str, Any], analysis_id: str) -> \
+    # Optional[str]:
+    #     """Gera o gráfico de previsão e salva na pasta."""
+    #     try:
+    #         fig, ax = plt.subplots(figsize=(12, 6))
+    #         ax.set_title('Previsão da Taxa de Evasão', fontsize=16)
+    #
+    #         # Dados de treino
+    #         ax.plot(train_series.index, train_series.values,
+    #                 label='Treino', marker='o', linewidth=2, color='blue')
+    #
+    #         # Dados de teste (se disponível)
+    #         if forecast_result.get('test_x') and forecast_result.get('test_y'):
+    #             test_x = pd.to_datetime(forecast_result['test_x'])
+    #             ax.plot(test_x, forecast_result['test_y'],
+    #                     label='Teste', marker='o', linewidth=2, color='green')
+    #
+    #         # Previsões
+    #         forecast_x = pd.to_datetime(forecast_result['forecast_x'])
+    #         ax.plot(forecast_x, forecast_result['forecast_y'],
+    #                 label='Previsão', marker='s', linestyle='--', linewidth=2, color='red')
+    #
+    #         # Intervalo de confiança
+    #         if forecast_result.get('forecast_ci_lower') and forecast_result.get('forecast_ci_upper'):
+    #             lower = forecast_result['forecast_ci_lower']
+    #             upper = forecast_result['forecast_ci_upper']
+    #             ax.fill_between(forecast_x, lower, upper,
+    #                             color='red', alpha=0.2, label='IC 95%')
+    #
+    #         ax.legend(fontsize=12)
+    #         ax.grid(True, alpha=0.3)
+    #         ax.set_xlabel('Semestre', fontsize=12)
+    #         ax.set_ylabel('Taxa de Evasão (%)', fontsize=12)
+    #         plt.xticks(rotation=45)
+    #         plt.tight_layout()
+    #
+    #         filename = self._generate_unique_filename("previsao", analysis_id)
+    #         return self._save_plot_to_file(fig, filename)
+    #
+    #     except Exception as e:
+    #         logger.warning(f"Erro ao gerar gráfico de previsão: {e}")
+    #         return None
+    #
+    # def _generate_autocorrelation_plot(self, series: pd.Series, autocorr_result: Dict[str, Any], analysis_id: str) -> \
+    # Optional[Dict[str, str]]:
+    #     """Gera os gráficos de ACF e PACF e salva na pasta."""
+    #     try:
+    #         if not autocorr_result:
+    #             return None
+    #
+    #         from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
+    #
+    #         # Gerar ACF
+    #         fig_acf = plt.figure(figsize=(10, 5))
+    #         plot_acf(series, ax=fig_acf.gca(), lags=min(10, len(series) // 2 - 1))
+    #         fig_acf.gca().set_title('Função de Autocorrelação (ACF)', fontsize=14)
+    #         fig_acf.gca().grid(True, alpha=0.3)
+    #         acf_filename = self._generate_unique_filename("acf", analysis_id)
+    #         acf_path = self._save_plot_to_file(fig_acf, acf_filename)
+    #
+    #         # Gerar PACF
+    #         fig_pacf = plt.figure(figsize=(10, 5))
+    #         plot_pacf(series, ax=fig_pacf.gca(), lags=min(10, len(series) // 2 - 1))
+    #         fig_pacf.gca().set_title('Função de Autocorrelação Parcial (PACF)', fontsize=14)
+    #         fig_pacf.gca().grid(True, alpha=0.3)
+    #         pacf_filename = self._generate_unique_filename("pacf", analysis_id)
+    #         pacf_path = self._save_plot_to_file(fig_pacf, pacf_filename)
+    #
+    #         return {'acf_plot': acf_path, 'pacf_plot': pacf_path}
+    #
+    #     except Exception as e:
+    #         logger.warning(f"Erro ao gerar gráfico de autocorrelação: {e}")
+    #         return None
 
     # --- MÉTODOS DE ANÁLISE PRINCIPAL ---
     def perform_analysis(self, data_series: pd.Series, semestre_corte_str: Optional[str] = None,
@@ -331,16 +331,16 @@ class EvasionAnalyzer:
             }
 
             # MODIFICAÇÃO: Gerar e salvar os gráficos na pasta public_imagens
-            plot_paths = {
-                'decomposition_plot': self._generate_decomposition_plot(train_series, results['decomposition'],
-                                                                        analysis_id),
-                'forecast_plot': self._generate_forecast_plot(train_series, results['forecast'], analysis_id),
-                'autocorrelation_plots': self._generate_autocorrelation_plot(train_series, results['autocorrelation'],
-                                                                             analysis_id)
-            }
+            # plot_paths = {
+            #     'decomposition_plot': self._generate_decomposition_plot(train_series, results['decomposition'],
+            #                                                             analysis_id),
+            #     'forecast_plot': self._generate_forecast_plot(train_series, results['forecast'], analysis_id),
+            #     'autocorrelation_plots': self._generate_autocorrelation_plot(train_series, results['autocorrelation'],
+            #                                                                  analysis_id)
+            # }
 
             # Adicionar caminhos dos arquivos ao resultado
-            results['plot_files'] = plot_paths
+            #results['plot_files'] = plot_paths
 
             logger.info(f"Análise {analysis_id} concluída com sucesso. Gráficos salvos em: {Config.IMAGES_FOLDER}")
             return results
