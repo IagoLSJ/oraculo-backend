@@ -1,4 +1,3 @@
-import os
 import uuid
 import pandas as pd
 import logging
@@ -13,8 +12,6 @@ from sktime.forecasting.arima import AutoARIMA
 import traceback
 from sklearn.metrics import mean_absolute_percentage_error
 from datetime import datetime, timedelta
-import matplotlib
-
 # --- Configuração de Logging ---
 logging.basicConfig(
     level=logging.INFO,
