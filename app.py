@@ -22,20 +22,13 @@ logger = logging.getLogger(__name__)
 # --- Configuração da Aplicação ---
 app = Flask(__name__)
 CORS(app)
+class Config:
+    UPLOAD_FOLDER = Path("/uploads")
+    MAX_CONTENT_LENGTH = 16 * 1024 * 1024
+    ALLOWED_EXTENSIONS = {'.csv'}
+    MIN_DATA_POINTS = 8
 
-def cleanup_old_files(days=7):
-    """Remove arquivos mais antigos que N dias"""
-    cutoff = datetime.now() - timedelta(days=days)
-    for filepath in Config.UPLOAD_FOLDER.glob("*.csv"):
-        if datetime.fromtimestamp(filepath.stat().st_mtime) < cutoff:
-            filepath.unlink()
-            logger.info(f"Arquivo deletado: {filepath}")
-
-# Executar periodicamente (ex: com APScheduler)
-from apscheduler.schedulers.background import BackgroundScheduler
-scheduler = BackgroundScheduler()
-scheduler.add_job(cleanup_old_files, 'interval', hours=24)
-scheduler.start()
+Config.UPLOAD_FOLDER.mkdir(exist_ok=True)
 
 # Configurações como constantes
 class Config:
